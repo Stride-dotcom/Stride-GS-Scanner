@@ -1,1 +1,1429 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>QR Scanner — Stride WMS</title>
+<style>
+/* ============================================================
+   RESET & TOKENS
+   ============================================================ */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
+:root {
+  --bg:      #0d1117;
+  --surface: #161b27;
+  --card:    #1e2536;
+  --border:  #2a3347;
+  --accent:  #E85D2D;
+  --success: #10b981;
+  --warning: #f59e0b;
+  --danger:  #ef4444;
+  --text:    #e8edf5;
+  --muted:   #8896a8;
+  --radius:  10px;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  font-size: 14px;
+  overflow-y: auto;
+  min-height: 100dvh;
+  padding-top: 54px; /* space for fixed header */
+  padding-bottom: 20px;
+}
+
+/* ============================================================
+   CAMERA LAYER  (fullscreen behind everything)
+   ============================================================ */
+/* Scanner viewfinder — fixed-size box, NOT fullscreen */
+#camera-bg {
+  position: relative;
+  width: 100%;
+  max-width: 400px;
+  margin: 12px auto 0;
+  aspect-ratio: 1 / 1;
+  background: #111;
+  border-radius: 16px;
+  overflow: hidden;
+}
+#cam-video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+  border-radius: 16px;
+}
+
+/* html5-qrcode fallback container — same size as camera-bg */
+#reader-container {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  border-radius: 16px;
+}
+#reader-container video {
+  width: 100% !important;
+  height: 100% !important;
+  object-fit: cover !important;
+}
+/* Hide all html5-qrcode built-in controls / dashboard UI */
+#reader-container__dashboard,
+#reader-container__header_message,
+#reader-container__status_span,
+[id^="reader-container__dashboard"],
+#reader-container > img,
+#reader-container > button,
+#reader-container select { display: none !important; }
+
+/* Start-camera overlay */
+#start-camera-wrap {
+  position: absolute; inset: 0; z-index: 5;
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+  background: rgba(0,0,0,0.85);
+}
+#start-camera-wrap.hidden { display: none !important; }
+#start-camera-btn {
+  background: var(--accent); color: #fff;
+  border: none; border-radius: 16px;
+  padding: 20px 44px; font-size: 18px; font-weight: 700;
+  cursor: pointer; -webkit-tap-highlight-color: transparent;
+  box-shadow: 0 4px 24px rgba(232,93,45,0.45);
+  letter-spacing: 0.2px;
+}
+#start-camera-btn:active { opacity: 0.85; }
+#start-camera-hint {
+  color: var(--muted); font-size: 12px;
+  margin-top: 14px; text-align: center; line-height: 1.6;
+  padding: 0 32px;
+}
+
+.cam-error {
+  position: absolute; inset: 0;
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+  color: var(--muted); text-align: center;
+  font-size: 13px; line-height: 1.7; padding: 24px;
+  background: rgba(0,0,0,0.6);
+}
+.cam-error small { font-size: 11px; margin-top: 4px; opacity: 0.6; }
+
+/* ============================================================
+   SCAN FRAME OVERLAY  (corner brackets + scan line)
+   ============================================================ */
+.scan-overlay {
+  position: absolute; inset: 0; z-index: 10;
+  pointer-events: none;
+  display: flex; align-items: center; justify-content: center;
+}
+
+.scan-frame {
+  position: relative;
+  width: 65%; height: 65%;
+  max-width: 230px; max-height: 230px;
+}
+
+.scan-corner {
+  position: absolute;
+  width: 28px; height: 28px;
+  border-color: rgba(255,255,255,0.9);
+  border-style: solid; border-width: 0;
+}
+.scan-corner.tl { top: 0; left: 0;     border-top-width: 3px; border-left-width: 3px;   border-top-left-radius: 4px; }
+.scan-corner.tr { top: 0; right: 0;    border-top-width: 3px; border-right-width: 3px;  border-top-right-radius: 4px; }
+.scan-corner.bl { bottom: 0; left: 0;  border-bottom-width: 3px; border-left-width: 3px;  border-bottom-left-radius: 4px; }
+.scan-corner.br { bottom: 0; right: 0; border-bottom-width: 3px; border-right-width: 3px; border-bottom-right-radius: 4px; }
+
+.scan-line {
+  position: absolute; left: 4px; right: 4px;
+  height: 2px;
+  background: linear-gradient(90deg, transparent, var(--accent) 40%, var(--accent) 60%, transparent);
+  box-shadow: 0 0 8px rgba(59,130,246,0.8);
+  animation: scanLine 2s ease-in-out infinite;
+}
+@keyframes scanLine {
+  0%   { top: 4px;              opacity: 0; }
+  8%   { opacity: 1; }
+  92%  { opacity: 1; }
+  100% { top: calc(100% - 4px); opacity: 0; }
+}
+
+/* ============================================================
+   SCAN BADGE  (status label above the scan frame)
+   ============================================================ */
+.scan-badge {
+  position: absolute;
+  left: 50%; transform: translateX(-50%);
+  top: 8px;
+  background: rgba(0,0,0,0.65); backdrop-filter: blur(8px);
+  color: #fff; padding: 5px 18px;
+  border-radius: 20px; font-size: 12px; font-weight: 600;
+  z-index: 12; pointer-events: none; white-space: nowrap;
+  transition: background 0.25s;
+}
+.scan-badge.loc-scanned { background: rgba(16,185,129,0.85); }
+
+/* ============================================================
+   HEADER  (frosted glass, fixed at top)
+   ============================================================ */
+.header {
+  position: fixed; top: 0; left: 0; right: 0; z-index: 50;
+  background: rgba(13,17,23,0.88); backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  border-bottom: 1px solid rgba(42,51,71,0.5);
+  padding: 9px 13px;
+  display: flex; justify-content: space-between; align-items: center;
+  height: 54px;
+}
+.header-left { display: flex; align-items: center; gap: 9px; }
+.stride-logo { height: 34px; width: auto; object-fit: contain; display: block; }
+.brand-wrap  { display: flex; align-items: baseline; gap: 5px; line-height: 1; }
+.brand-name  { font-weight: 700; font-size: 15px; letter-spacing: -0.3px; color: #e8edf5; }
+.brand-wms   {
+  font-size: 10px; font-weight: 800; letter-spacing: 0.5px;
+  color: #E85D2D; background: rgba(232,93,45,0.15);
+  border-radius: 4px; padding: 2px 5px;
+  text-transform: uppercase;
+}
+.header-right { display: flex; gap: 6px; align-items: center; }
+.icon-btn {
+  background: rgba(30,37,54,0.7); border: 1px solid rgba(42,51,71,0.6);
+  color: var(--text); width: 36px; height: 36px;
+  border-radius: 8px; display: flex; align-items: center; justify-content: center;
+  cursor: pointer; font-size: 16px; text-decoration: none;
+  -webkit-tap-highlight-color: transparent;
+}
+.icon-btn:active { background: var(--border); }
+
+/* Sensor Active indicator */
+.sensor-indicator {
+  display: flex; align-items: center; gap: 5px;
+  font-size: 11px; color: var(--success); font-weight: 600;
+  padding: 4px 8px;
+  background: rgba(16,185,129,0.12);
+  border: 1px solid rgba(16,185,129,0.25);
+  border-radius: 20px;
+  white-space: nowrap;
+}
+.sensor-indicator.hidden { display: none !important; }
+.sensor-dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--success); flex-shrink: 0;
+  animation: pulse-dot 1.5s ease-in-out infinite;
+}
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%       { opacity: 0.35; transform: scale(0.65); }
+}
+
+/* ============================================================
+   SETTINGS PANEL  (slides below header)
+   ============================================================ */
+.settings-panel {
+  position: fixed; top: 54px; left: 0; right: 0; z-index: 45;
+  background: rgba(22,27,39,0.97); backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border-bottom: 1px solid var(--border);
+  padding: 6px 14px 10px;
+}
+.settings-row {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 8px 0; border-bottom: 1px solid var(--border);
+  font-size: 13px; color: var(--muted);
+}
+.settings-row:last-of-type { border-bottom: none; }
+.settings-row span:first-child { color: var(--text); }
+.settings-status {
+  font-size: 11px; color: var(--muted);
+  padding-top: 6px; min-height: 16px; line-height: 1.4;
+}
+
+/* ============================================================
+   BOTTOM PANEL  (drawer: queue + location + action)
+   ============================================================ */
+.bottom-panel {
+  position: relative;
+  max-width: 400px;
+  margin: 12px auto 0;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  overflow: hidden;
+  padding-bottom: 8px;
+}
+.panel-handle {
+  width: 36px; height: 4px;
+  background: var(--border); border-radius: 2px;
+  margin: 10px auto 6px;
+  flex-shrink: 0;
+}
+.panel-section {
+  padding: 8px 13px 6px;
+  border-bottom: 1px solid var(--border);
+}
+.panel-section:last-of-type { border-bottom: none; }
+.panel-section-head {
+  display: flex; justify-content: space-between; align-items: center;
+  margin-bottom: 4px;
+}
+.panel-footer {
+  padding: 10px 12px 6px;
+}
+
+/* ============================================================
+   QUEUE LIST
+   ============================================================ */
+.queue-list {
+  max-height: 200px; overflow-y: auto;
+}
+.empty-hint {
+  color: var(--muted); text-align: center;
+  padding: 12px 0 8px; font-size: 13px;
+}
+.queue-item {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 8px 0; border-bottom: 1px solid var(--border);
+  animation: slideIn 0.15s ease;
+}
+.queue-item:last-child { border-bottom: none; }
+@keyframes slideIn {
+  from { opacity: 0; transform: translateY(-5px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.qi-left   { display: flex; align-items: center; gap: 10px; min-width: 0; flex: 1; }
+.qi-status { font-size: 13px; width: 18px; text-align: center; flex-shrink: 0; }
+.qi-text   { min-width: 0; flex: 1; }
+.qi-id {
+  font-weight: 700; font-family: 'SF Mono','Fira Code',monospace; font-size: 15px;
+  display: block; line-height: 1.2;
+}
+.qi-sub {
+  font-size: 11px; color: var(--muted); display: block;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 1px;
+}
+.qi-remove {
+  background: none; border: none; color: var(--danger);
+  font-size: 20px; padding: 0 4px; cursor: pointer; line-height: 1;
+  flex-shrink: 0; opacity: 0.7;
+}
+.qi-remove:active { opacity: 1; }
+.status-ok   .qi-status { color: var(--success); }
+.status-load .qi-status { color: var(--muted); }
+.status-warn .qi-status { color: var(--warning); }
+
+.manual-row {
+  display: flex; gap: 8px;
+  padding: 8px 0 2px;
+  border-top: 1px solid var(--border);
+}
+
+/* ============================================================
+   SECTION TITLE / BADGE
+   ============================================================ */
+.section-title {
+  font-weight: 700; font-size: 11px;
+  text-transform: uppercase; letter-spacing: 0.9px; color: var(--muted);
+}
+.badge {
+  display: inline-block; background: var(--accent); color: #fff;
+  border-radius: 10px; padding: 1px 7px;
+  font-size: 11px; font-weight: 700; margin-left: 5px;
+}
+
+/* ============================================================
+   LOCATION
+   ============================================================ */
+.loc-selected {
+  display: flex; align-items: center; gap: 8px;
+  padding: 4px 0 2px; min-height: 28px;
+}
+.loc-chip {
+  background: var(--success); color: #fff;
+  border-radius: 20px; padding: 3px 12px;
+  font-size: 13px; font-weight: 700; font-family: monospace; letter-spacing: 0.5px;
+}
+.loc-label-hint { font-size: 12px; color: var(--muted); }
+
+.autocomplete-wrap { padding: 6px 0 4px; }
+.loc-input {
+  width: 100%;
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: 8px; color: var(--text);
+  padding: 11px 14px; font-size: 15px;
+}
+.loc-input:focus { outline: none; border-color: var(--accent); }
+.loc-input::placeholder { color: var(--muted); }
+
+/* Dropdown renders inline (no absolute) to avoid overflow-clip issues in the panel */
+.loc-dropdown {
+  margin-top: 4px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  max-height: 160px; overflow-y: auto;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.5);
+}
+.loc-dropdown.hidden { display: none !important; }
+.dd-item {
+  padding: 12px 14px; cursor: pointer;
+  font-size: 14px; font-family: monospace; font-weight: 600;
+  border-bottom: 1px solid var(--border); transition: background 0.1s;
+}
+.dd-item:last-child { border-bottom: none; }
+.dd-item:hover, .dd-item.dd-focused { background: var(--accent); color: #fff; }
+.dd-empty { padding: 12px 14px; color: var(--muted); font-size: 13px; }
+
+/* ============================================================
+   UPDATE BUTTON
+   ============================================================ */
+.btn-update {
+  width: 100%; padding: 15px;
+  background: var(--success); color: #fff;
+  border: none; border-radius: var(--radius);
+  font-size: 16px; font-weight: 700; cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  transition: background 0.2s, opacity 0.15s;
+}
+.btn-update:disabled { background: var(--border); color: var(--muted); cursor: default; }
+.btn-update:not(:disabled):active { opacity: 0.85; }
+
+/* ============================================================
+   SHARED BUTTONS / INPUTS
+   ============================================================ */
+.btn-sm {
+  padding: 6px 12px; border-radius: 6px;
+  font-size: 12px; font-weight: 600; cursor: pointer;
+  background: var(--card); color: var(--text);
+  border: 1px solid var(--border);
+}
+.btn-sm:active { opacity: 0.8; }
+.btn-ghost-sm {
+  background: transparent; color: var(--muted);
+  border: none; padding: 4px 8px; font-size: 13px; cursor: pointer;
+}
+.btn-ghost-sm:active { color: var(--text); }
+.btn-primary-full {
+  width: 100%; padding: 14px;
+  background: var(--accent); color: #fff;
+  border: none; border-radius: 8px;
+  font-size: 15px; font-weight: 700; cursor: pointer;
+}
+.btn-primary-full:active { opacity: 0.85; }
+
+input[type="text"] {
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: 8px; color: var(--text);
+  padding: 10px 12px; font-size: 14px; flex: 1; min-width: 0;
+}
+input[type="text"]:focus { outline: none; border-color: var(--accent); }
+input::placeholder { color: var(--muted); }
+
+/* ============================================================
+   OVERLAYS
+   ============================================================ */
+.overlay {
+  position: fixed; inset: 0;
+  background: rgba(0,0,0,0.82); z-index: 300;
+  display: flex; align-items: center; justify-content: center; padding: 20px;
+}
+.overlay.hidden { display: none !important; }
+.overlay-card {
+  background: var(--surface); border-radius: 16px;
+  border: 1px solid var(--border);
+  padding: 28px 22px; width: 100%;
+  max-width: 420px; max-height: 85vh; overflow-y: auto;
+}
+.loading-card { text-align: center; padding: 44px 28px; max-width: 240px; }
+.spinner {
+  width: 44px; height: 44px;
+  border: 3px solid var(--border); border-top-color: var(--accent);
+  border-radius: 50%; animation: spin 0.7s linear infinite;
+  margin: 0 auto 18px;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+#loading-msg { color: var(--muted); font-size: 14px; }
+
+.results-icon { font-size: 44px; text-align: center; margin-bottom: 10px; display: block; }
+.results-icon.icon-success { color: var(--success); }
+.results-icon.icon-warn    { color: var(--warning); }
+.results-icon.icon-err     { color: var(--danger); }
+.results-title { font-size: 18px; font-weight: 700; text-align: center; margin-bottom: 18px; }
+.results-body  { margin-bottom: 18px; }
+
+.result-section  { margin-bottom: 14px; }
+.result-sec-label {
+  font-size: 10px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: 0.9px; margin-bottom: 6px;
+}
+.result-sec-label.lbl-ok   { color: var(--success); }
+.result-sec-label.lbl-warn { color: var(--warning); }
+.result-sec-label.lbl-err  { color: var(--danger); }
+.result-row {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 7px 10px; border-radius: 6px; font-size: 13px; margin-bottom: 3px;
+}
+.row-ok   { background: rgba(16,185,129,0.12); }
+.row-warn { background: rgba(245,158,11,0.12); }
+.row-err  { background: rgba(239,68,68,0.12); }
+.rr-id     { font-weight: 700; font-family: monospace; }
+.rr-client { color: var(--muted); font-size: 11px; }
+.result-hint { font-size: 11px; color: var(--muted); margin-top: 6px; line-height: 1.4; }
+
+/* ============================================================
+   TOAST
+   ============================================================ */
+.toast {
+  position: fixed; bottom: 100px; left: 50%; transform: translateX(-50%);
+  padding: 10px 20px; border-radius: 24px;
+  font-size: 13px; font-weight: 600; z-index: 500;
+  white-space: nowrap; max-width: 88vw;
+  overflow: hidden; text-overflow: ellipsis;
+  pointer-events: none;
+}
+.toast.hidden { display: none; }
+.toast-ok   { background: var(--success); color: #fff; }
+.toast-warn { background: var(--warning); color: #111; }
+.toast-err  { background: var(--danger); color: #fff; }
+.toast-info { background: var(--card); color: var(--text); border: 1px solid var(--border); }
+
+::-webkit-scrollbar { width: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+.hidden { display: none !important; }
+</style>
+</head>
+<body>
+
+<!-- ============================================================
+     CAMERA LAYER  (fullscreen, z-index 0)
+     ============================================================ -->
+<div id="camera-bg">
+  <!-- Native BarcodeDetector path: direct video element -->
+  <video id="cam-video" autoplay playsinline muted></video>
+
+  <!-- html5-qrcode fallback path: library manages video inside this div -->
+  <div id="reader-container" class="hidden"></div>
+
+  <!-- Scan frame overlay (inside camera box) -->
+  <div class="scan-overlay" id="scan-overlay">
+    <div class="scan-frame">
+      <div class="scan-corner tl"></div>
+      <div class="scan-corner tr"></div>
+      <div class="scan-corner bl"></div>
+      <div class="scan-corner br"></div>
+      <div class="scan-line"></div>
+    </div>
+  </div>
+
+  <!-- Scan status badge (inside camera box) -->
+  <div id="scan-badge" class="scan-badge">Ready to Scan</div>
+
+  <!-- Start Camera overlay: shown on load, hidden once camera is live -->
+  <div id="start-camera-wrap">
+    <button id="start-camera-btn" onclick="startCamera()">Start Camera</button>
+    <p id="start-camera-hint">Tap to activate the camera scanner.<br>You may be asked for camera permission.</p>
+  </div>
+</div>
+
+<!-- ============================================================
+     HEADER  (fixed, frosted glass)
+     ============================================================ -->
+<header class="header">
+  <div class="header-left">
+    <img src="https://static.wixstatic.com/media/a38fbc_e4bdb945b21f4b9f8b10873799e8f8f1~mv2.png"
+         class="stride-logo" alt="Stride Logistics">
+    <div class="brand-wrap">
+      <span class="brand-name">Stride Logistics</span>
+      <span class="brand-wms">WMS</span>
+      <span style="font-size:9px;color:var(--muted);margin-left:6px;">v2.1.0</span>
+    </div>
+  </div>
+  <div class="header-right">
+    <!-- Sensor Active indicator — hidden until camera starts -->
+    <div id="sensor-indicator" class="sensor-indicator hidden">
+      <span class="sensor-dot"></span>Sensor Active
+    </div>
+    <button class="icon-btn" onclick="toggleSettings()" title="Settings" aria-label="Settings">⚙</button>
+    <a href="?page=labels" class="icon-btn" title="Label Printer" aria-label="Label Printer">🏷</a>
+  </div>
+</header>
+
+<!-- ============================================================
+     SETTINGS PANEL  (fixed, slides below header)
+     ============================================================ -->
+<div id="settings-panel" class="settings-panel hidden">
+  <div class="settings-row">
+    <span>API URL</span>
+    <button class="btn-sm" onclick="changeApiUrl()">Change URL</button>
+  </div>
+  <div class="settings-row">
+    <span>Item Index</span>
+    <button class="btn-sm" onclick="doRefreshIndex()" id="refresh-btn">Rebuild Index</button>
+  </div>
+  <div class="settings-row">
+    <span>Camera</span>
+    <button class="btn-sm" onclick="flipCamera()">Flip Camera</button>
+  </div>
+  <div class="settings-row">
+    <span>Locations Sheet</span>
+    <button class="btn-sm" onclick="doSetupLocations()">Create Sheet</button>
+  </div>
+  <div class="settings-status" id="settings-status"></div>
+</div>
+
+<!-- ============================================================
+     BOTTOM PANEL  (drawer: queue + location + update button)
+     ============================================================ -->
+<div class="bottom-panel" id="bottom-panel">
+  <div class="panel-handle"></div>
+
+  <!-- Queue section -->
+  <div class="panel-section">
+    <div class="panel-section-head">
+      <span class="section-title">Items <span class="badge" id="queue-count">0</span></span>
+      <button class="btn-ghost-sm" onclick="clearQueue()">Clear ×</button>
+    </div>
+    <div id="queue-list" class="queue-list">
+      <p class="empty-hint">Scan item QR codes — they'll appear here</p>
+    </div>
+    <div class="manual-row">
+      <input type="text" id="manual-item" placeholder="Type 5-digit item ID…"
+             maxlength="5" inputmode="numeric" autocomplete="off">
+      <button class="btn-sm" onclick="addManualItem()">Add</button>
+    </div>
+  </div>
+
+  <!-- Location section -->
+  <div class="panel-section">
+    <div class="panel-section-head">
+      <span class="section-title">Location</span>
+      <span id="loc-chip" class="loc-chip hidden" aria-live="polite"></span>
+    </div>
+    <div class="loc-selected" id="loc-selected-row" style="display:none">
+      <span class="loc-label-hint">Selected:</span>
+      <span id="loc-chip-inline" class="loc-chip"></span>
+      <button class="btn-ghost-sm" onclick="clearLocation()">×</button>
+    </div>
+    <div class="autocomplete-wrap">
+      <input
+        type="text"
+        id="loc-input"
+        class="loc-input"
+        placeholder="🔍  Search or type location code…"
+        autocomplete="off"
+        spellcheck="false"
+        aria-label="Location code"
+        aria-autocomplete="list"
+        aria-controls="loc-dropdown"
+      >
+      <div id="loc-dropdown" class="loc-dropdown hidden" role="listbox"></div>
+    </div>
+  </div>
+
+  <!-- Update button -->
+  <div class="panel-footer">
+    <button id="update-btn" class="btn-update" onclick="commitUpdate()" disabled>
+      Update Items
+    </button>
+  </div>
+</div>
+
+<!-- ============================================================
+     RESULTS OVERLAY
+     ============================================================ -->
+<div id="overlay-results" class="overlay hidden" role="dialog" aria-modal="true">
+  <div class="overlay-card">
+    <span id="results-icon" class="results-icon">✓</span>
+    <h2 class="results-title" id="results-title">Update Complete</h2>
+    <div id="results-body" class="results-body"></div>
+    <button class="btn-primary-full" onclick="closeResults()">Scan More Items</button>
+  </div>
+</div>
+
+<!-- ============================================================
+     LOADING OVERLAY
+     ============================================================ -->
+<div id="overlay-loading" class="overlay hidden">
+  <div class="overlay-card loading-card">
+    <div class="spinner"></div>
+    <p id="loading-msg">Updating…</p>
+  </div>
+</div>
+
+<!-- ============================================================
+     TOAST
+     ============================================================ -->
+<div id="toast" class="toast hidden" aria-live="assertive"></div>
+
+<!-- ============================================================
+     URL SETUP MODAL  (shown on first open, before API_URL is known)
+     ============================================================ -->
+<div id="url-setup-modal" class="overlay hidden" role="dialog" aria-modal="true" aria-labelledby="url-modal-title">
+  <div class="overlay-card">
+    <div style="font-size:36px;text-align:center;margin-bottom:10px">🔗</div>
+    <h2 class="results-title" id="url-modal-title">Connect to Apps Script</h2>
+    <p style="font-size:13px;color:var(--muted);margin-bottom:16px;line-height:1.6;text-align:center">
+      Paste your deployed Apps Script web app URL.<br>
+      <span style="font-size:11px">Extensions → Apps Script → Deploy → Manage Deployments</span>
+    </p>
+    <input type="text" id="api-url-input"
+      style="width:100%;flex:none;margin-bottom:12px;font-family:monospace;font-size:12px"
+      placeholder="https://script.google.com/macros/s/…/exec"
+      autocomplete="off" spellcheck="false">
+    <button class="btn-primary-full" onclick="saveApiUrl()">Save &amp; Continue</button>
+    <p style="font-size:11px;color:var(--muted);margin-top:10px;text-align:center">
+      URL is saved in your browser's localStorage.
+    </p>
+  </div>
+</div>
+
+<!-- ============================================================
+     html5-qrcode — fallback scanner library for non-BarcodeDetector browsers
+     ============================================================ -->
+<script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+
+<script>
+'use strict';
+
+/* ============================================================
+   API — JSONP-based (bypasses CORS when loaded from file://)
+   ============================================================ */
+
+var API_URL = ''; // Set from localStorage by initApiUrl()
+var jsonpCounter = 0;
+
+function callAPI(action, params) {
+  if (!API_URL) {
+    return Promise.reject(new Error('API URL not configured. Open Settings → Change URL.'));
+  }
+  return new Promise(function (resolve, reject) {
+    var cbName = '__jsonp_cb_' + (jsonpCounter++);
+    var timeout = setTimeout(function () {
+      delete window[cbName];
+      if (script.parentNode) script.parentNode.removeChild(script);
+      reject(new Error('API timeout'));
+    }, 30000);
+
+    window[cbName] = function (data) {
+      clearTimeout(timeout);
+      delete window[cbName];
+      if (script.parentNode) script.parentNode.removeChild(script);
+      resolve(data);
+    };
+
+    var payload = (params && Object.keys(params).length)
+      ? encodeURIComponent(JSON.stringify(params)) : '';
+    var url = API_URL + '?action=' + encodeURIComponent(action) +
+      (payload ? '&payload=' + payload : '') +
+      '&callback=' + cbName;
+
+    var script = document.createElement('script');
+    script.src = url;
+    script.onerror = function () {
+      clearTimeout(timeout);
+      delete window[cbName];
+      if (script.parentNode) script.parentNode.removeChild(script);
+      reject(new Error('API request failed'));
+    };
+    document.body.appendChild(script);
+  });
+}
+
+function initApiUrl() {
+  API_URL = localStorage.getItem('GS_SCANNER_API_URL') || '';
+  // Camera starts only on user tap — don't auto-start
+  if (!API_URL) {
+    document.getElementById('url-setup-modal').classList.remove('hidden');
+  } else {
+    loadLocations();
+  }
+}
+
+function saveApiUrl() {
+  var url = document.getElementById('api-url-input').value.trim();
+  if (!url || url.indexOf('https://') !== 0) {
+    showToast('Please enter a valid https:// URL', 'err'); return;
+  }
+  API_URL = url;
+  localStorage.setItem('GS_SCANNER_API_URL', API_URL);
+  document.getElementById('url-setup-modal').classList.add('hidden');
+  loadLocations();
+}
+
+function changeApiUrl() {
+  document.getElementById('api-url-input').value = API_URL;
+  document.getElementById('url-setup-modal').classList.remove('hidden');
+}
+
+/* ============================================================
+   STATE
+   ============================================================ */
+var queue        = [];     // [{itemId, loadState:'loading'|'ok'|'warn', desc, client, loc}]
+var currentLoc   = '';
+var allLocations = [];
+var filteredLocs = [];
+var camStream    = null;
+var rafId        = null;   // requestAnimationFrame handle (native BarcodeDetector path)
+var html5Qr      = null;   // Html5Qrcode instance (fallback path)
+var useFrontCam  = false;
+var cameraActive = false;
+var audioCtx     = null;
+var scanGates    = {};     // code → timestamp, for debouncing
+var SCAN_GAP     = 400;    // ms — same code ignored within this window
+var ddFocusIdx   = -1;
+
+/* ============================================================
+   INIT
+   ============================================================ */
+window.addEventListener('DOMContentLoaded', function () {
+  document.getElementById('manual-item').addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') addManualItem();
+  });
+  document.getElementById('loc-input').addEventListener('input', function () {
+    filterLocations(this.value);
+  });
+  document.getElementById('loc-input').addEventListener('focus', function () {
+    filterLocations(this.value);
+  });
+  document.getElementById('loc-input').addEventListener('keydown', handleLocKeydown);
+  document.addEventListener('click', function (e) {
+    var wrap = document.querySelector('.autocomplete-wrap');
+    if (wrap && !wrap.contains(e.target)) closeDropdown();
+  });
+  // Resume AudioContext on first interaction
+  document.addEventListener('touchstart', function () {
+    if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+  }, { once: true });
+  document.addEventListener('click', function () {
+    if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+  }, { once: true });
+  initApiUrl();
+});
+
+/* ============================================================
+   CAMERA — entry point called by "Start Camera" button
+   ============================================================ */
+function startCamera() {
+  stopCamera().then(function () {
+    if (typeof BarcodeDetector !== 'undefined') {
+      startNativeCamera();
+    } else {
+      startFallbackCamera();
+    }
+  });
+}
+
+/* --- Native BarcodeDetector path (Chrome Android) --- */
+function startNativeCamera() {
+  var video = document.getElementById('cam-video');
+  video.classList.remove('hidden');
+  document.getElementById('reader-container').classList.add('hidden');
+
+  var constraints = {
+    video: {
+      facingMode: useFrontCam ? 'user' : 'environment',
+      width: { ideal: 1280 },
+      height: { ideal: 720 }
+    },
+    audio: false
+  };
+
+  navigator.mediaDevices.getUserMedia(constraints)
+    .then(function (stream) {
+      camStream = stream;
+      video.srcObject = stream;
+      video.play();
+      video.addEventListener('loadedmetadata', function onMeta() {
+        video.removeEventListener('loadedmetadata', onMeta);
+        hideStartBtn();
+        setCameraActive(true);
+
+        var detector = new BarcodeDetector({ formats: ['qr_code'] });
+
+        function tick() {
+          try {
+            if (video.readyState >= 2) {
+              detector.detect(video).then(function (barcodes) {
+                if (barcodes.length > 0) {
+                  try { onScanSuccess(barcodes[0].rawValue); } catch (ignore) {}
+                }
+              }).catch(function () {});
+            }
+          } catch (e) { /* never let a frame error kill the loop */ }
+          rafId = requestAnimationFrame(tick);
+        }
+        rafId = requestAnimationFrame(tick);
+      });
+    })
+    .catch(function (err) {
+      showCameraError(String(err));
+    });
+}
+
+/* --- html5-qrcode fallback path (iOS Safari, other browsers) --- */
+function startFallbackCamera() {
+  document.getElementById('cam-video').classList.add('hidden');
+  var container = document.getElementById('reader-container');
+  container.classList.remove('hidden');
+
+  try {
+    html5Qr = new Html5Qrcode('reader-container');
+    html5Qr.start(
+      { facingMode: useFrontCam ? 'user' : 'environment' },
+      { fps: 15, qrbox: { width: 250, height: 250 }, aspectRatio: 1 },
+      function (decoded) {
+        try { onScanSuccess(decoded); } catch (e) {}
+      },
+      function () {} /* MUST be non-null empty function — errors are silent */
+    ).then(function () {
+      hideStartBtn();
+      setCameraActive(true);
+    }).catch(function (err) {
+      html5Qr = null;
+      showCameraError(String(err));
+    });
+  } catch (err) {
+    html5Qr = null;
+    showCameraError(String(err));
+  }
+}
+
+/* --- Stop everything and return a promise that resolves when done --- */
+function stopCamera() {
+  // Cancel native RAF loop
+  if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
+
+  // Stop native stream
+  if (camStream) {
+    camStream.getTracks().forEach(function (t) { t.stop(); });
+    camStream = null;
+  }
+  var video = document.getElementById('cam-video');
+  if (video) { video.srcObject = null; }
+
+  // Stop html5-qrcode instance
+  var stopPromise;
+  if (html5Qr) {
+    var inst = html5Qr;
+    html5Qr = null;
+    stopPromise = inst.stop().catch(function () {});
+  } else {
+    stopPromise = Promise.resolve();
+  }
+
+  setCameraActive(false);
+  return stopPromise;
+}
+
+/* --- Flip between front and rear camera --- */
+function flipCamera() {
+  useFrontCam = !useFrontCam;
+  startCamera();
+}
+
+/* --- UI helpers --- */
+function hideStartBtn() {
+  var wrap = document.getElementById('start-camera-wrap');
+  if (wrap) wrap.classList.add('hidden');
+}
+
+function setCameraActive(active) {
+  cameraActive = active;
+  var ind = document.getElementById('sensor-indicator');
+  if (ind) ind.classList.toggle('hidden', !active);
+}
+
+function showCameraError(msg) {
+  var wrap = document.getElementById('start-camera-wrap');
+  if (!wrap) return;
+  wrap.classList.remove('hidden');
+  wrap.innerHTML =
+    '<div class="cam-error">' + esc(msg) +
+    '<br><small>Allow camera permission and try again.</small></div>' +
+    '<button id="start-camera-btn" style="margin-top:16px" onclick="startCamera()">Retry</button>';
+}
+
+/* ============================================================
+   SCAN HANDLER — routes to item or location handler
+   ============================================================ */
+function onScanSuccess(raw) {
+  var text = raw.trim();
+  if (!text) return;
+
+  var now = Date.now();
+  if (scanGates[text] && now - scanGates[text] < SCAN_GAP) return;
+  scanGates[text] = now;
+
+  var badge = document.getElementById('scan-badge');
+  badge.textContent = text;
+
+  if (/^\d{5}$/.test(text)) {
+    badge.className = 'scan-badge';
+    handleItemScan(text);
+  } else {
+    badge.className = 'scan-badge loc-scanned';
+    setTimeout(function () { badge.className = 'scan-badge'; badge.textContent = 'Ready to Scan'; }, 2500);
+    handleLocationScan(text);
+  }
+}
+
+/* ============================================================
+   ITEM HANDLING
+   ============================================================ */
+function handleItemScan(itemId) {
+  for (var i = 0; i < queue.length; i++) {
+    if (queue[i].itemId === itemId) {
+      playBeep('dup'); showToast(itemId + ' already queued', 'warn'); return;
+    }
+  }
+  playBeep('ok');
+  haptic('ok');
+  queue.push({ itemId: itemId, loadState: 'loading', desc: '', client: '', loc: '' });
+  renderQueue();
+  updateBtn();
+  fetchDetails(itemId);
+}
+
+function fetchDetails(itemId) {
+  callAPI('lookupItem', { itemId: itemId })
+    .then(function (r) { applyDetails(itemId, r); })
+    .catch(function (e) { applyDetailError(itemId, e.message || String(e)); });
+}
+
+function applyDetails(itemId, r) {
+  for (var i = 0; i < queue.length; i++) {
+    if (queue[i].itemId !== itemId) continue;
+    if (!r) {
+      queue[i].loadState = 'warn'; queue[i].desc = 'Lookup failed';
+    } else if (r.found === false) {
+      queue[i].loadState = 'warn';
+      queue[i].desc = r.error ? r.error : 'Not in index — try Rebuild Index';
+    } else {
+      queue[i].loadState = 'ok';
+      queue[i].client = r.clientName || '';
+      var parts = [r.vendor, r.description].filter(Boolean);
+      queue[i].desc = parts.join(' · ').substring(0, 50);
+      queue[i].loc  = r.currentLocation || '';
+    }
+    break;
+  }
+  renderQueue();
+}
+
+function applyDetailError(itemId, msg) {
+  for (var i = 0; i < queue.length; i++) {
+    if (queue[i].itemId === itemId) {
+      queue[i].loadState = 'warn'; queue[i].desc = msg || 'Lookup error'; break;
+    }
+  }
+  renderQueue();
+}
+
+function removeFromQueue(itemId) {
+  queue = queue.filter(function (x) { return x.itemId !== itemId; });
+  renderQueue(); updateBtn();
+}
+
+function clearQueue() {
+  queue = []; renderQueue(); updateBtn();
+}
+
+function addManualItem() {
+  var inp = document.getElementById('manual-item');
+  var v   = inp.value.trim();
+  if (!/^\d{5}$/.test(v)) { showToast('Item ID must be exactly 5 digits', 'err'); haptic('err'); return; }
+  inp.value = '';
+  handleItemScan(v);
+}
+
+function renderQueue() {
+  var el = document.getElementById('queue-list');
+  document.getElementById('queue-count').textContent = queue.length;
+
+  if (!queue.length) {
+    el.innerHTML = '<p class="empty-hint">Scan item QR codes — they\'ll appear here</p>';
+    return;
+  }
+
+  el.innerHTML = queue.map(function (item) {
+    var stateClass = item.loadState === 'loading' ? 'status-load'
+      : (item.loadState === 'warn' ? 'status-warn' : 'status-ok');
+    var icon = item.loadState === 'loading' ? '⏳'
+      : (item.loadState === 'warn' ? '⚠' : '✓');
+
+    var sub = item.loadState === 'loading' ? 'Looking up…'
+      : (item.loadState === 'warn' ? esc(item.desc || 'Not found')
+        : [esc(item.client), esc(item.desc)].filter(Boolean).join(' · '));
+
+    if (item.loadState === 'ok' && item.loc) {
+      sub += ' <span style="color:var(--muted)">@ ' + esc(item.loc) + '</span>';
+    }
+
+    return '<div class="queue-item ' + stateClass + '">' +
+      '<div class="qi-left">' +
+        '<span class="qi-status">' + icon + '</span>' +
+        '<div class="qi-text">' +
+          '<span class="qi-id">' + esc(item.itemId) + '</span>' +
+          '<span class="qi-sub">' + sub + '</span>' +
+        '</div>' +
+      '</div>' +
+      '<button class="qi-remove" onclick="removeFromQueue(\'' + esc(item.itemId) + '\')" ' +
+        'aria-label="Remove ' + esc(item.itemId) + '">×</button>' +
+    '</div>';
+  }).join('');
+}
+
+/* ============================================================
+   LOCATION HANDLING
+   ============================================================ */
+function handleLocationScan(loc) {
+  if (!loc) return;
+  setLocation(loc);
+  if (queue.length > 0) {
+    showToast('Location set — updating ' + queue.length + ' item' + (queue.length !== 1 ? 's' : '') + '…', 'ok');
+    setTimeout(commitUpdate, 400);
+  } else {
+    showToast('Location set: ' + loc + ' (scan items first)', 'info');
+  }
+}
+
+function setLocation(loc) {
+  currentLoc = loc.trim();
+
+  var chip = document.getElementById('loc-chip');
+  chip.textContent = currentLoc; chip.classList.remove('hidden');
+
+  var inlineChip = document.getElementById('loc-chip-inline');
+  inlineChip.textContent = currentLoc;
+  document.getElementById('loc-selected-row').style.display = 'flex';
+
+  var inp = document.getElementById('loc-input');
+  inp.value = currentLoc;
+  closeDropdown();
+  updateBtn();
+}
+
+function clearLocation() {
+  currentLoc = '';
+  document.getElementById('loc-chip').classList.add('hidden');
+  document.getElementById('loc-selected-row').style.display = 'none';
+  document.getElementById('loc-input').value = '';
+  updateBtn();
+}
+
+function loadLocations() {
+  callAPI('getLocations')
+    .then(function (locs) {
+      allLocations = Array.isArray(locs) ? locs : [];
+      filteredLocs = allLocations.slice();
+    })
+    .catch(function (e) {
+      console.warn('loadLocations failed:', e);
+    });
+}
+
+/* ============================================================
+   AUTOCOMPLETE
+   ============================================================ */
+function filterLocations(query) {
+  query = (query || '').trim();
+  if (query) { currentLoc = query; }
+  updateBtn();
+
+  if (!query) {
+    filteredLocs = allLocations.slice();
+  } else {
+    var q = query.toLowerCase();
+    filteredLocs = allLocations.filter(function (l) {
+      return l.toLowerCase().indexOf(q) !== -1;
+    });
+  }
+  renderDropdown();
+}
+
+function renderDropdown() {
+  var dd = document.getElementById('loc-dropdown');
+  ddFocusIdx = -1;
+
+  if (!filteredLocs.length) {
+    dd.innerHTML = '<div class="dd-empty">No matching locations</div>';
+    dd.classList.remove('hidden');
+    return;
+  }
+
+  dd.innerHTML = filteredLocs.slice(0, 14).map(function (loc, idx) {
+    return '<div class="dd-item" role="option" data-idx="' + idx + '" ' +
+      'onmousedown="selectLocation(\'' + esc(loc) + '\')">' +
+      esc(loc) + '</div>';
+  }).join('');
+  dd.classList.remove('hidden');
+}
+
+function closeDropdown() {
+  document.getElementById('loc-dropdown').classList.add('hidden');
+  ddFocusIdx = -1;
+}
+
+function selectLocation(loc) {
+  setLocation(loc);
+}
+
+function handleLocKeydown(e) {
+  var dd    = document.getElementById('loc-dropdown');
+  var items = dd.querySelectorAll('.dd-item');
+
+  if (e.key === 'Escape') { closeDropdown(); return; }
+
+  if (e.key === 'ArrowDown') {
+    e.preventDefault();
+    ddFocusIdx = Math.min(ddFocusIdx + 1, items.length - 1);
+    highlightDd(items);
+  } else if (e.key === 'ArrowUp') {
+    e.preventDefault();
+    ddFocusIdx = Math.max(ddFocusIdx - 1, 0);
+    highlightDd(items);
+  } else if (e.key === 'Enter') {
+    e.preventDefault();
+    if (ddFocusIdx >= 0 && items[ddFocusIdx]) {
+      selectLocation(items[ddFocusIdx].textContent.trim());
+    } else {
+      var v = document.getElementById('loc-input').value.trim();
+      if (v) setLocation(v);
+    }
+    ddFocusIdx = -1;
+  }
+}
+
+function highlightDd(items) {
+  for (var i = 0; i < items.length; i++) {
+    items[i].classList.toggle('dd-focused', i === ddFocusIdx);
+  }
+  if (items[ddFocusIdx]) items[ddFocusIdx].scrollIntoView({ block: 'nearest' });
+}
+
+/* ============================================================
+   COMMIT UPDATE
+   ============================================================ */
+function updateBtn() {
+  var btn = document.getElementById('update-btn');
+  var ok  = queue.length > 0 && currentLoc.length > 0;
+  btn.disabled = !ok;
+  if (ok) {
+    btn.textContent = 'Update ' + queue.length + ' Item' +
+      (queue.length !== 1 ? 's' : '') + ' → ' + currentLoc;
+  } else {
+    btn.textContent = 'Update Items';
+  }
+}
+
+function commitUpdate() {
+  if (!queue.length || !currentLoc) return;
+  var ids = queue.map(function (x) { return x.itemId; });
+  var loc = currentLoc;
+
+  showLoading('Updating ' + ids.length + ' item' + (ids.length !== 1 ? 's' : '') + ' → ' + loc + '…');
+
+  callAPI('updateLocations', { itemIds: ids, location: loc })
+    .then(function (resp) {
+      hideLoading();
+      if (resp && resp.success) {
+        showResults(resp.results, loc);
+        clearQueue();
+      } else {
+        showToast((resp && resp.message) ? resp.message : 'Update failed', 'err');
+        haptic('err');
+      }
+    })
+    .catch(function (e) {
+      hideLoading();
+      showToast('Error: ' + (e.message || String(e)), 'err');
+      haptic('err');
+    });
+}
+
+/* ============================================================
+   RESULTS
+   ============================================================ */
+function showResults(results, loc) {
+  var upd = (results.updated  || []).length;
+  var nf  = (results.notFound || []).length;
+  var err = (results.errors   || []).length;
+
+  var iconEl  = document.getElementById('results-icon');
+  var titleEl = document.getElementById('results-title');
+  var bodyEl  = document.getElementById('results-body');
+
+  if (upd > 0 && nf === 0 && err === 0) {
+    iconEl.textContent = '✓'; iconEl.className = 'results-icon icon-success';
+    titleEl.textContent = upd + ' item' + (upd !== 1 ? 's' : '') + ' → ' + loc;
+    playBeep('ok'); haptic('ok');
+  } else if (upd > 0) {
+    iconEl.textContent = '⚠'; iconEl.className = 'results-icon icon-warn';
+    titleEl.textContent = upd + ' updated, ' + (nf + err) + ' issue' + ((nf + err) !== 1 ? 's' : '');
+    haptic('err');
+  } else {
+    iconEl.textContent = '✗'; iconEl.className = 'results-icon icon-err';
+    titleEl.textContent = 'Update Failed';
+    haptic('err');
+  }
+
+  var html = '';
+  if (upd > 0) {
+    html += '<div class="result-section"><div class="result-sec-label lbl-ok">Updated (' + upd + ')</div>';
+    results.updated.forEach(function (item) {
+      html += '<div class="result-row row-ok">' +
+        '<span class="rr-id">' + esc(item.itemId) + '</span>' +
+        '<span class="rr-client">' + esc(item.clientName || '') + '</span></div>';
+    });
+    html += '</div>';
+  }
+  if (nf > 0) {
+    html += '<div class="result-section"><div class="result-sec-label lbl-warn">Not Found (' + nf + ')</div>';
+    results.notFound.forEach(function (id) {
+      html += '<div class="result-row row-warn"><span class="rr-id">' + esc(id) + '</span></div>';
+    });
+    html += '<p class="result-hint">These item IDs weren\'t in the index. ' +
+      'Try Settings → Rebuild Index if the items exist in a client sheet.</p></div>';
+  }
+  if (err > 0) {
+    html += '<div class="result-section"><div class="result-sec-label lbl-err">Errors (' + err + ')</div>';
+    results.errors.forEach(function (e) {
+      html += '<div class="result-row row-err">' +
+        '<span class="rr-id">' + esc(e.itemId || '') + '</span>' +
+        '<span class="rr-client">' + esc(e.error || '') + '</span></div>';
+    });
+    html += '</div>';
+  }
+
+  bodyEl.innerHTML = html;
+  document.getElementById('overlay-results').classList.remove('hidden');
+}
+
+function closeResults() {
+  document.getElementById('overlay-results').classList.add('hidden');
+}
+
+/* ============================================================
+   SETTINGS
+   ============================================================ */
+function toggleSettings() {
+  document.getElementById('settings-panel').classList.toggle('hidden');
+}
+
+function doRefreshIndex() {
+  var btn = document.getElementById('refresh-btn');
+  btn.disabled = true;
+  setSettingsStatus('Rebuilding index — this may take 30–60s…');
+  callAPI('rebuildIndex')
+    .then(function (r) {
+      btn.disabled = false;
+      if (r && r.success) {
+        var s = r.stats;
+        var msg = '✓ ' + s.items + ' items across ' + s.clients + ' clients.';
+        if (s.duplicates && s.duplicates.length) msg += ' ' + s.duplicates.length + ' duplicate IDs found.';
+        if (s.errors && s.errors.length) msg += ' Errors: ' + s.errors.join('; ');
+        setSettingsStatus(msg);
+        loadLocations();
+      } else {
+        setSettingsStatus('✗ ' + ((r && r.message) ? r.message : 'Build failed'));
+      }
+    })
+    .catch(function (e) {
+      btn.disabled = false;
+      setSettingsStatus('✗ ' + (e.message || String(e)));
+    });
+}
+
+function doSetupLocations() {
+  setSettingsStatus('Creating Locations sheet…');
+  callAPI('setupLocations')
+    .then(function (r) {
+      setSettingsStatus(r.created ? '✓ Locations sheet created with sample codes.' :
+        'ℹ ' + (r.message || 'Already exists.'));
+      if (r.created) loadLocations();
+    })
+    .catch(function (e) { setSettingsStatus('✗ ' + (e.message || String(e))); });
+}
+
+function setSettingsStatus(msg) {
+  document.getElementById('settings-status').textContent = msg;
+}
+
+/* ============================================================
+   LOADING / TOAST
+   ============================================================ */
+function showLoading(msg) {
+  document.getElementById('loading-msg').textContent = msg || 'Loading…';
+  document.getElementById('overlay-loading').classList.remove('hidden');
+}
+function hideLoading() {
+  document.getElementById('overlay-loading').classList.add('hidden');
+}
+
+var _toastTimer = null;
+function showToast(msg, type) {
+  var el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className = 'toast toast-' + (type || 'info');
+  if (_toastTimer) clearTimeout(_toastTimer);
+  _toastTimer = setTimeout(function () { el.className = 'toast hidden'; }, 2800);
+}
+
+/* ============================================================
+   AUDIO  (Web Audio API)
+   ============================================================ */
+function _getCtx() {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  return audioCtx;
+}
+
+function playBeep(type) {
+  try {
+    var ctx  = _getCtx();
+    var osc  = ctx.createOscillator();
+    var gain = ctx.createGain();
+    osc.connect(gain); gain.connect(ctx.destination);
+    var t = ctx.currentTime;
+    if (type === 'ok') {
+      osc.frequency.value = 1047;
+      gain.gain.setValueAtTime(0.22, t);
+      gain.gain.exponentialRampToValueAtTime(0.001, t + 0.13);
+      osc.start(t); osc.stop(t + 0.13);
+    } else if (type === 'dup') {
+      osc.frequency.value = 880;
+      gain.gain.setValueAtTime(0.14, t);
+      gain.gain.exponentialRampToValueAtTime(0.001, t + 0.08);
+      osc.start(t); osc.stop(t + 0.08);
+    } else {
+      osc.type = 'sawtooth';
+      osc.frequency.setValueAtTime(440, t);
+      osc.frequency.linearRampToValueAtTime(280, t + 0.22);
+      gain.gain.setValueAtTime(0.18, t);
+      gain.gain.exponentialRampToValueAtTime(0.001, t + 0.22);
+      osc.start(t); osc.stop(t + 0.22);
+    }
+  } catch (e) { /* audio unavailable — fail silently */ }
+}
+
+/* ============================================================
+   HAPTIC  (navigator.vibrate)
+   ============================================================ */
+function haptic(type) {
+  if (!navigator.vibrate) return;
+  navigator.vibrate(type === 'ok' ? 40 : [80, 40, 80]);
+}
+
+/* ============================================================
+   UTIL
+   ============================================================ */
+function esc(s) {
+  return String(s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+</script>
+</body>
+</html>
