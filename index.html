@@ -36,9 +36,8 @@ body {
 }
 
 /* ============================================================
-   CAMERA LAYER  (fullscreen behind everything)
+   CAMERA LAYER
    ============================================================ */
-/* Scanner viewfinder — fixed-size box, NOT fullscreen */
 #camera-bg {
   position: relative;
   width: 100%;
@@ -57,7 +56,7 @@ body {
   border-radius: 16px;
 }
 
-/* html5-qrcode fallback container — same size as camera-bg */
+/* html5-qrcode fallback container */
 #reader-container {
   width: 100%;
   height: 100%;
@@ -164,7 +163,8 @@ body {
   z-index: 12; pointer-events: none; white-space: nowrap;
   transition: background 0.25s;
 }
-.scan-badge.loc-scanned { background: rgba(16,185,129,0.85); }
+.scan-badge.loc-scanned  { background: rgba(16,185,129,0.85); }
+.scan-badge.item-scanned { background: rgba(232,93,45,0.85); }
 
 /* ============================================================
    HEADER  (frosted glass, fixed at top)
@@ -357,7 +357,6 @@ body {
 .loc-input:focus { outline: none; border-color: var(--accent); }
 .loc-input::placeholder { color: var(--muted); }
 
-/* Dropdown renders inline (no absolute) to avoid overflow-clip issues in the panel */
 .loc-dropdown {
   margin-top: 4px;
   background: var(--card);
@@ -498,7 +497,7 @@ input::placeholder { color: var(--muted); }
 <body>
 
 <!-- ============================================================
-     CAMERA LAYER  (fullscreen, z-index 0)
+     CAMERA LAYER
      ============================================================ -->
 <div id="camera-bg">
   <!-- Native BarcodeDetector path: direct video element -->
@@ -538,11 +537,10 @@ input::placeholder { color: var(--muted); }
     <div class="brand-wrap">
       <span class="brand-name">Stride Logistics</span>
       <span class="brand-wms">WMS</span>
-      <span style="font-size:9px;color:var(--muted);margin-left:6px;">v2.1.0</span>
+      <span style="font-size:9px;color:var(--muted);margin-left:6px;">v2.2.0</span>
     </div>
   </div>
   <div class="header-right">
-    <!-- Sensor Active indicator — hidden until camera starts -->
     <div id="sensor-indicator" class="sensor-indicator hidden">
       <span class="sensor-dot"></span>Sensor Active
     </div>
@@ -590,8 +588,8 @@ input::placeholder { color: var(--muted); }
       <p class="empty-hint">Scan item QR codes — they'll appear here</p>
     </div>
     <div class="manual-row">
-      <input type="text" id="manual-item" placeholder="Type 5-digit item ID…"
-             maxlength="5" inputmode="numeric" autocomplete="off">
+      <input type="text" id="manual-item" placeholder="Type item ID or ITEM:…"
+             autocomplete="off" spellcheck="false">
       <button class="btn-sm" onclick="addManualItem()">Add</button>
     </div>
   </div>
@@ -680,16 +678,14 @@ input::placeholder { color: var(--muted); }
   </div>
 </div>
 
-<!-- ============================================================
-     html5-qrcode — fallback scanner library for non-BarcodeDetector browsers
-     ============================================================ -->
+<!-- html5-qrcode — fallback scanner library for non-BarcodeDetector browsers -->
 <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
 
 <script>
 'use strict';
 
 /* ============================================================
-   API — JSONP-based (bypasses CORS when loaded from file://)
+   API — JSONP-based (bypasses CORS when loaded from GitHub Pages)
    ============================================================ */
 
 var API_URL = ''; // Set from localStorage by initApiUrl()
@@ -734,7 +730,6 @@ function callAPI(action, params) {
 
 function initApiUrl() {
   API_URL = localStorage.getItem('GS_SCANNER_API_URL') || '';
-  // Camera starts only on user tap — don't auto-start
   if (!API_URL) {
     document.getElementById('url-setup-modal').classList.remove('hidden');
   } else {
@@ -771,9 +766,13 @@ var html5Qr      = null;   // Html5Qrcode instance (fallback path)
 var useFrontCam  = false;
 var cameraActive = false;
 var audioCtx     = null;
-var scanGates    = {};     // code → timestamp, for debouncing
+var scanGates    = {};     // normalized code → timestamp (dedup)
 var SCAN_GAP     = 400;    // ms — same code ignored within this window
 var ddFocusIdx   = -1;
+
+/* Scan engine — sequential processing queue */
+var scanQueue      = [];   // raw strings pending dispatch
+var scanProcessing = false;
 
 /* ============================================================
    INIT
@@ -793,7 +792,6 @@ window.addEventListener('DOMContentLoaded', function () {
     var wrap = document.querySelector('.autocomplete-wrap');
     if (wrap && !wrap.contains(e.target)) closeDropdown();
   });
-  // Resume AudioContext on first interaction
   document.addEventListener('touchstart', function () {
     if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
   }, { once: true });
@@ -802,6 +800,126 @@ window.addEventListener('DOMContentLoaded', function () {
   }, { once: true });
   initApiUrl();
 });
+
+/* ============================================================
+   SECTION A — SCAN PAYLOAD PARSER
+   parseScan(raw) → { raw, normalized, entityType, typed, value, prefix, format }
+   entityType: 'item' | 'location' | 'unknown'
+   typed:      true if ITEM:/LOC: prefix present
+   value:      bare code after prefix stripping
+   ============================================================ */
+function parseScan(raw) {
+  var normalized = String(raw || '').trim();
+  if (!normalized) return null;
+
+  /* --- Typed payloads always win --- */
+  if (normalized.indexOf('ITEM:') === 0) {
+    var val = normalized.substring(5).trim();
+    if (!val) return null;
+    return { raw: raw, normalized: normalized, entityType: 'item',
+             typed: true, value: val, prefix: 'ITEM:', format: 'typed' };
+  }
+  if (normalized.indexOf('LOC:') === 0) {
+    var val = normalized.substring(4).trim();
+    if (!val) return null;
+    return { raw: raw, normalized: normalized, entityType: 'location',
+             typed: true, value: val, prefix: 'LOC:', format: 'typed' };
+  }
+
+  /* --- SECTION B — Legacy raw resolution --- */
+  /* 1. Check against known locations list (case-insensitive) */
+  for (var i = 0; i < allLocations.length; i++) {
+    if (allLocations[i].toLowerCase() === normalized.toLowerCase()) {
+      return { raw: raw, normalized: normalized, entityType: 'location',
+               typed: false, value: normalized, prefix: '', format: 'legacy' };
+    }
+  }
+
+  /* 2. Fall through: treat as item ID — backend will confirm via index */
+  return { raw: raw, normalized: normalized, entityType: 'item',
+           typed: false, value: normalized, prefix: '', format: 'legacy' };
+}
+
+/* ============================================================
+   SECTION C — SCAN ENGINE
+   Buffered sequential queue, 400ms dedup, per-scan error handling.
+   ============================================================ */
+
+/**
+ * Entry point from camera callbacks and USB scanner.
+ * Applies dedup gate then enqueues for sequential dispatch.
+ */
+function enqueueScan(raw) {
+  var normalized = String(raw || '').trim();
+  if (!normalized) return;
+
+  /* 400ms duplicate suppression keyed on normalized string */
+  var now = Date.now();
+  if (scanGates[normalized] && now - scanGates[normalized] < SCAN_GAP) return;
+  scanGates[normalized] = now;
+
+  scanQueue.push(raw);
+  drainScanQueue();
+}
+
+/**
+ * Process one scan at a time from the queue.
+ * Since item/location handlers are synchronous (async work runs independently),
+ * the drain loop completes in a single tick for typical scan bursts.
+ */
+function drainScanQueue() {
+  if (scanProcessing || !scanQueue.length) return;
+  scanProcessing = true;
+  var raw = scanQueue.shift();
+  try {
+    dispatchScan(raw);
+  } catch (e) {
+    /* per-scan error: log but don't kill the engine */
+    console.warn('Scan dispatch error:', e);
+  }
+  scanProcessing = false;
+  /* recurse for any queued items */
+  if (scanQueue.length) drainScanQueue();
+}
+
+/** Reset the engine: clear queue and gate state. */
+function resetScanEngine() {
+  scanQueue      = [];
+  scanProcessing = false;
+  scanGates      = {};
+}
+
+/**
+ * Parse and route a single raw scan value.
+ * Called by drainScanQueue — errors are caught by the caller.
+ */
+function dispatchScan(raw) {
+  var parsed = parseScan(raw);
+  if (!parsed) return;
+
+  var badge = document.getElementById('scan-badge');
+  badge.textContent = parsed.value;
+
+  if (parsed.entityType === 'location') {
+    badge.className = 'scan-badge loc-scanned';
+    setTimeout(function () {
+      badge.className = 'scan-badge';
+      badge.textContent = 'Ready to Scan';
+    }, 2500);
+    handleLocationScan(parsed.value);
+  } else {
+    badge.className = 'scan-badge item-scanned';
+    setTimeout(function () {
+      badge.className = 'scan-badge';
+    }, 800);
+    handleItemScan(parsed.value);
+  }
+}
+
+/* Legacy entry point called directly by camera callbacks */
+function onScanSuccess(raw) {
+  enqueueScan(raw);
+}
 
 /* ============================================================
    CAMERA — entry point called by "Start Camera" button
@@ -877,7 +995,7 @@ function startFallbackCamera() {
       function (decoded) {
         try { onScanSuccess(decoded); } catch (e) {}
       },
-      function () {} /* MUST be non-null empty function — errors are silent */
+      function () {} /* silent error callback required by html5-qrcode */
     ).then(function () {
       hideStartBtn();
       setCameraActive(true);
@@ -893,10 +1011,8 @@ function startFallbackCamera() {
 
 /* --- Stop everything and return a promise that resolves when done --- */
 function stopCamera() {
-  // Cancel native RAF loop
   if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
 
-  // Stop native stream
   if (camStream) {
     camStream.getTracks().forEach(function (t) { t.stop(); });
     camStream = null;
@@ -904,7 +1020,6 @@ function stopCamera() {
   var video = document.getElementById('cam-video');
   if (video) { video.srcObject = null; }
 
-  // Stop html5-qrcode instance
   var stopPromise;
   if (html5Qr) {
     var inst = html5Qr;
@@ -918,13 +1033,11 @@ function stopCamera() {
   return stopPromise;
 }
 
-/* --- Flip between front and rear camera --- */
 function flipCamera() {
   useFrontCam = !useFrontCam;
   startCamera();
 }
 
-/* --- UI helpers --- */
 function hideStartBtn() {
   var wrap = document.getElementById('start-camera-wrap');
   if (wrap) wrap.classList.add('hidden');
@@ -947,33 +1060,10 @@ function showCameraError(msg) {
 }
 
 /* ============================================================
-   SCAN HANDLER — routes to item or location handler
-   ============================================================ */
-function onScanSuccess(raw) {
-  var text = raw.trim();
-  if (!text) return;
-
-  var now = Date.now();
-  if (scanGates[text] && now - scanGates[text] < SCAN_GAP) return;
-  scanGates[text] = now;
-
-  var badge = document.getElementById('scan-badge');
-  badge.textContent = text;
-
-  if (/^\d{5}$/.test(text)) {
-    badge.className = 'scan-badge';
-    handleItemScan(text);
-  } else {
-    badge.className = 'scan-badge loc-scanned';
-    setTimeout(function () { badge.className = 'scan-badge'; badge.textContent = 'Ready to Scan'; }, 2500);
-    handleLocationScan(text);
-  }
-}
-
-/* ============================================================
    ITEM HANDLING
    ============================================================ */
 function handleItemScan(itemId) {
+  /* deduplicate against existing queue */
   for (var i = 0; i < queue.length; i++) {
     if (queue[i].itemId === itemId) {
       playBeep('dup'); showToast(itemId + ' already queued', 'warn'); return;
@@ -1031,12 +1121,25 @@ function clearQueue() {
   queue = []; renderQueue(); updateBtn();
 }
 
+/**
+ * Manual item entry — accepts any item ID format.
+ * Also accepts typed payloads: ITEM:01234 or LOC:WW1.
+ */
 function addManualItem() {
   var inp = document.getElementById('manual-item');
   var v   = inp.value.trim();
-  if (!/^\d{5}$/.test(v)) { showToast('Item ID must be exactly 5 digits', 'err'); haptic('err'); return; }
+  if (!v) { showToast('Enter an item ID', 'err'); haptic('err'); return; }
   inp.value = '';
-  handleItemScan(v);
+
+  /* Route through the same parser the camera uses */
+  var parsed = parseScan(v);
+  if (!parsed) { showToast('Empty input', 'err'); return; }
+
+  if (parsed.entityType === 'location') {
+    handleLocationScan(parsed.value);
+  } else {
+    handleItemScan(parsed.value);
+  }
 }
 
 function renderQueue() {
@@ -1205,7 +1308,9 @@ function highlightDd(items) {
 }
 
 /* ============================================================
-   COMMIT UPDATE
+   SECTION D — BATCH WORKFLOW / COMMIT UPDATE
+   Items are staged as they're scanned (with background individual lookups).
+   Committing sends all staged IDs to updateLocations in one call.
    ============================================================ */
 function updateBtn() {
   var btn = document.getElementById('update-btn');
@@ -1232,6 +1337,7 @@ function commitUpdate() {
       if (resp && resp.success) {
         showResults(resp.results, loc);
         clearQueue();
+        resetScanEngine();
       } else {
         showToast((resp && resp.message) ? resp.message : 'Update failed', 'err');
         haptic('err');
